@@ -7,3 +7,4 @@ database:
 
 scrapeIntervalSeconds: 5
 port: 9030
+tsmStatus: true

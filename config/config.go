@@ -5,6 +5,7 @@ type Configurations struct {
 	Database              DatabaseConfigurations
 	ScrapeIntervalSeconds int64
 	Port                  int
+	TsmStatus             bool
 }
 
 // DatabaseConfigurations exported

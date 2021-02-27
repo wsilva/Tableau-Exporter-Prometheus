@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -59,8 +61,28 @@ var (
 		Buckets: []float64{0.5, 1, 2, 3, 4, 5, 10, 15, 20, 30, 40, 50, 60},
 	}, []string{"project", "workbook", "view"})
 
+	nodeStatusCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tableau_node_status",
+		Help: "The ammount of Tableau servers nodes in each status (running,degraded,error,stopped)",
+	}, []string{"nodename", "hostname", "status"})
+
+	processStatusCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tableau_process_status",
+		Help: "The ammount of Tableau processes in each status (is running, status is unavailable, is in a degraded state, is in an error state, is synchronizing, is decommissioning, is running (Active Repository), is running (Passive Repository), is stopped)",
+	}, []string{"nodename", "hostname", "processname", "status"})
+
 	m = map[string]float64{}
 )
+
+// structure to store each node and status
+type nodeSTATUS struct {
+	nodename, hostname, status string
+}
+
+// structure to store each process and status
+type processSTATUS struct {
+	nodename, hostname, processname, status string
+}
 
 func WaitForCtrlC() {
 	var end_waiter sync.WaitGroup
@@ -173,8 +195,102 @@ func main() {
 
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", config.Database.Host, config.Database.Port, config.Database.User, config.Database.Password, config.Database.Name)
 	fmt.Println("Tableau DB connection: " + fmt.Sprintf("host=%s port=%d user=%s password=*** dbname=%s sslmode=disable", config.Database.Host, config.Database.Port, config.Database.User, config.Database.Name))
+	fmt.Printf("Run tsm status command set to: %t\n", config.TsmStatus)
 	var firstConnection bool = true
 
+	// runs only if tsm status config is set to true
+	if config.TsmStatus {
+
+		// routine to run tsm status -v from time to time
+		go func() {
+			fmt.Println("Starting routine to fetch metrics from tsm cli.")
+			for {
+
+				var (
+					str                                                        []string
+					nodename, hostname, nodestatus, processName, processStatus string
+				)
+				node := make(map[nodeSTATUS]int)
+				process := make(map[processSTATUS]int)
+				tsmcmd := "tsm status -v"
+				tsm := strings.Split(tsmcmd, " ")
+
+				// run tsm status -v command
+				out, err := exec.Command(tsm[0], tsm[1:]...).Output()
+				if err != nil {
+					fmt.Printf("Error running %s: %v", tsmcmd, err)
+				}
+				scanner := bufio.NewScanner(strings.NewReader(string(out)))
+
+				// parsing each line
+				for scanner.Scan() {
+					ln := scanner.Text()
+
+					if strings.Contains(ln, "node") { // if it finds the word node just store it
+						str = strings.Split(ln, ": ")
+						nodename = str[0]
+						hostname = str[1]
+					} else if strings.Contains(ln, "Status: ") { // if it finds the word Status we fill the struct...
+						str = strings.Split(ln, "Status: ")
+						nodestatus = strings.ToLower(str[1])
+						// fmt.Printf("Node %s(%s): %s\n", nodename, hostname, nodestatus)
+						n := nodeSTATUS{
+							nodename: nodename,
+							hostname: hostname,
+							status:   nodestatus,
+						}
+						// ... and check if exists in node map to initialize or increment
+						qtde, ok := node[n]
+						if ok {
+							node[n] = qtde + 1
+						} else {
+							node[n] = 1
+						}
+					} else if strings.Contains(ln, "Tableau Server ") { // if it finds "Tableu Server" we parse the process name and it's status...
+						startprocess := strings.Index(ln, "Tableau Server ")
+						endprocess := strings.Index(ln, "' ")
+						if startprocess != -1 && endprocess != -1 {
+							processName = strings.ToLower(strings.TrimSpace(ln[startprocess+15 : endprocess-2]))
+							processStatus = strings.ToLower(strings.TrimSpace(ln[endprocess+1 : len(ln)-1]))
+							// ... we fill the struct ...
+							p := processSTATUS{
+								nodename:    nodename,
+								hostname:    hostname,
+								processname: processName,
+								status:      processStatus,
+							}
+							// ... and check if it exists in process map to increment or initialize
+							qtde, ok := process[p]
+							if ok {
+								process[p] = qtde + 1
+							} else {
+								process[p] = 1
+							}
+						} else {
+							fmt.Println("Process name or Status could not be parsed.")
+						}
+
+					}
+					// else {
+					// 	fmt.Println("Not able to parse this line")
+					// }
+				}
+
+				// iterate over node map and process map and set the prometheus with values
+				for n, qtde := range node {
+					nodeStatusCount.WithLabelValues(n.nodename, n.hostname, n.status).Set(float64(qtde))
+				}
+				for p, qtde := range process {
+					processStatusCount.WithLabelValues(p.nodename, p.hostname, p.processname, p.status).Set(float64(qtde))
+				}
+
+				// wait for the next iteration
+				time.Sleep(time.Duration(config.ScrapeIntervalSeconds) * time.Second)
+			}
+		}()
+	}
+
+	// routine to fetch metrics from the database
 	go func() {
 		for {
 
